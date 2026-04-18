@@ -25,8 +25,10 @@ from tqdm import tqdm
 from typing import Tuple, List
 from torch_rechub.models.ranking import DeepFM
 from torch_rechub.basic.features import DenseFeature, SparseFeature
-
+from utils import seed_everything
 from dataset import CriteoDataset
+
+seed_everything(42)  # 确保全局随机种子固定，结果可复现
 
 # 创建 logger 文件夹并生成带时间戳的日志文件名
 os.makedirs('./logger', exist_ok=True)
@@ -176,16 +178,19 @@ def evaluate(
 
 def main() -> None:
     # ---- Hyperparameters ------------------------------------------ #
-    train_path    = './data/Criteo_small/train.txt'
+    train_path    = './data/Criteo_sample/train_sample.txt'  # 请确保这个路径指向正确的训练数据文件
     ckpt_dir      = './checkpoints'
-    batch_size    = 4096        # 8GB VRAM 比较充裕，可以提升到 2048 或 4096 提高 GPU 吞吐
-    num_epochs    = 10          # 轮数稍增加
+    batch_size    = 1024 * 8       # 8GB VRAM 比较充裕，可以提升到 2048 或 4096 提高 GPU 吞吐
+    num_epochs    = 50          # 轮数稍增加
     learning_rate = 1e-3
+    warmup_epochs = 2           # linear warmup steps (in epochs)
     weight_decay  = 1e-5        # [新增] 防止过拟合的权重衰减
     embed_dim     = 32          # 典型的 CTR Embedding 维度推荐用 16-64 之间
     mlp_dims      = [256, 128, 64] # 加深了网络
-    dropout       = 0.5        # 根据刚才的严重过拟合，提高到 0.3
+    dropout       = 0.3         # 根据刚才的严重过拟合，提高到 0.3
     val_ratio     = 0.1         # fraction of training data held out for validation
+    early_stop_patience = 5     # stop if no AUC improvement for N epochs
+    early_stop_min_delta = 1e-4 # minimum AUC gain to reset patience
     device        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -262,16 +267,29 @@ def main() -> None:
         optimizer, mode='max', patience=2, factor=0.5
     )
 
+    def set_lr(new_lr: float) -> None:
+        for group in optimizer.param_groups:
+            group['lr'] = new_lr
+
+    if warmup_epochs > 0:
+        set_lr(0.0)
+
     logger.info(
         f'Device : {device} Train  : {train_size:,} samples Val    : {val_size:,} samples'
     )
 
     # ---- Training loop -------------------------------------------- #
-    best_auc = 0.0
+    best_auc = float('-inf')
+    no_improve_epochs = 0
     for epoch in range(1, num_epochs + 1):
+        if warmup_epochs > 0 and epoch <= warmup_epochs:
+            # Linear warmup from 0 to learning_rate
+            warmup_lr = learning_rate * (epoch / warmup_epochs)
+            set_lr(warmup_lr)
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
         val_auc, val_logloss, val_acc, val_pre, val_rec, val_f1 = evaluate(model, val_loader, device)
-        scheduler.step(val_auc)
+        if epoch > warmup_epochs:
+            scheduler.step(val_auc)
 
         lr_now = optimizer.param_groups[0]['lr']
         logger.info(
@@ -287,11 +305,18 @@ def main() -> None:
         )
 
         # Persist checkpoint whenever validation AUC improves
-        if val_auc > best_auc:
+        if val_auc > best_auc + early_stop_min_delta:
             best_auc  = val_auc
+            no_improve_epochs = 0
             ckpt_path = os.path.join(ckpt_dir, 'deepfm_best.pth')
             torch.save(model.state_dict(), ckpt_path)
             logger.info(f'=> Best model saved  (AUC={best_auc:.4f}, LogLoss={val_logloss:.4f}, F1={val_f1:.4f})')
+        else:
+            no_improve_epochs += 1
+            logger.info(f'=> No AUC improvement for {no_improve_epochs} epoch(s)')
+            if no_improve_epochs >= early_stop_patience:
+                logger.info(f'=> Early stopping triggered after {early_stop_patience} epochs without improvement')
+                break
 
     logger.info(f'\nTraining complete.  Best Val AUC: {best_auc:.4f}')
 

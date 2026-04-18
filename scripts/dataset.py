@@ -7,7 +7,8 @@ description:
     - The class is designed to be used with PyTorch's DataLoader for efficient data loading and batching.
     - The dataset class also includes functionality for visualizing sample images from the dataset.
 '''
-
+import os
+import tqdm
 import torch.utils as utils
 import doctest
 import torch
@@ -52,68 +53,75 @@ def preReadData(data_path):
 
 
 def Process_Data(data_path):
-    """
-    ---
-    Note
-    ---
-    - There are 13 features taking integer values (mostly count features) and 26 categorical features. 
-    - The values of the categorical features have been hashed onto 32 bits for anonymization purposes.
-    - The semantic of these features is undisclosed. Some features may have missing values.
-    - The rows are chronologically ordered.
-    - Format: The columns are tab separeted with the following schema:
-        <label> <integer feature 1> ... <integer feature 13> <categorical feature 1> ... <categorical feature 26>
-    - When a value is missing, the field is just empty.
-    
-    ---
-    Args
-    ---
-    - data_path: the path of the data file, e.g. './data/Criteo_small/train.txt'
-    
-    ---
-    Returns
-    ---
-    - data: a pandas DataFrame containing the processed data, with missing values filled and features transformed.
-    - sparse_vocab_size: a dictionary mapping each sparse feature to its vocabulary size (number of unique values).
-    - dense_features: a list of the names of the dense features (I1 to I13).
-    - sparse_features: a list of the names of the sparse features (C1 to C26).
-    
-    """
     # --- Step 1: Define feature column names ---
     dense_features = ['I' + str(i) for i in range(1, 14)] # 13 integer/count dense features: I1 to I13
     sparse_features = ['C' + str(i) for i in range(1, 27)] # 26 hashed categorical sparse features: C1 to C26
     col_names = ['label'] + dense_features + sparse_features
 
-    # --- Step 2: Read the raw tab-separated file ---
-    # Missing values (empty fields) are automatically parsed as NaN by pandas
-    data = pd.read_csv(data_path, sep='\t', header=None, names=col_names)
-
-    # --- Step 3: Fill missing values ---
-    # Dense: fill with column median — robust to heavy-tailed count distributions
-    #        and avoids distorting the mean with extreme outliers
-    data[dense_features] = data[dense_features].fillna(data[dense_features].median())
+    # 定义对应的 Numpy 压缩文件路径
+    npz_path = data_path.replace('.txt', '.npz').replace('.csv', '.npz')
     
-    # Sparse: fill with the string "unknown" so missing values become
-    #         a distinct, encodable category rather than silently dropping rows
-    data[sparse_features] = data[sparse_features].fillna('unknown')
+    if os.path.exists(npz_path):
+        print(f"Loading processed data directly from Numpy file: {npz_path}...")
+        # 如果存在已经处理好的 npz，使用 np.load 加载
+        loaded = np.load(npz_path, allow_pickle=True)
+        
+        # 将各列重新组装回 DataFrame（这样可以完美保持原本的 int 和 float 数据类型）
+        data_dict = {col: loaded[col] for col in col_names}
+        data = pd.DataFrame(data_dict)
+        
+        # 恢复 vocab 字典
+        sparse_vocab_size = loaded['vocab'].item()
+    else:
+        print(f"Raw data processing started from {data_path} (This may take a while)...")
+        
+        # --- 核心优化 1：使用 chunksize 分块读取以降低峰值内存 ---
+        print("Progress: [1~2/4] Reading raw generic TSV file in chunks & Fill NaNs...")
+        chunk_list = []
+        chunk_size = 500000  # 每次读取 50 万行
+        
+        # pd.read_csv 的 chunksize 参数会返回一个按块读取的生成器，防止巨大的内存一次性分配
+        df_iter = pd.read_csv(data_path, sep='\t', header=None, names=col_names, chunksize=chunk_size)
+        
+        for chunk in tqdm(df_iter, desc="Reading & Processing Chunks"):
+            # 在每个 Chunk 内部进行填补，避免读取全部数据后产生巨型 boolean mask 造成极具毁灭性的内存溢出
+            # Dense: 为了统一且高效地分配内存，使用 0 填充
+            chunk[dense_features] = chunk[dense_features].fillna(0.0)
+            # Sparse: 填充 unknown
+            chunk[sparse_features] = chunk[sparse_features].fillna('unknown')
+            
+            # --- 核心优化 2：精确下转数据类型以继续缩小内存基数 ---
+            chunk[dense_features] = chunk[dense_features].astype(np.float32)
+            chunk['label'] = chunk['label'].astype(np.float32)
+            
+            chunk_list.append(chunk)
 
-    # --- Step 4: Normalize dense features to [0, 1] ---
-    # MinMaxScaler preserves relative magnitudes and produces bounded inputs
-    # suitable for feeding directly into the MLP component of DeepFM
-    scaler = MinMaxScaler()
-    data[dense_features] = scaler.fit_transform(data[dense_features])
+        print("Concatenating chunks into a single DataFrame...")
+        data = pd.concat(chunk_list, ignore_index=True)
+        del chunk_list # 手动释放列表引用的内存
+        
+        # --- Step 4: Normalize dense features to [0, 1] ---
+        print("Progress: [3/4] Normalizing dense features vs MinMaxScaler...")
+        scaler = MinMaxScaler()
+        data[dense_features] = scaler.fit_transform(data[dense_features])
+        data[dense_features] = data[dense_features].astype(np.float32)
 
-    # --- Step 5: Encode sparse features as contiguous integer indices ---
-    # LabelEncoder maps each unique hash string (and "unknown") to an integer
-    # in [0, num_classes - 1], which is the format required by nn.Embedding
-    for feat in sparse_features:
-        le = LabelEncoder()
-        data[feat] = pd.Series(le.fit_transform(data[feat]), index=data.index)
+        # --- Step 5: Encode sparse features ---
+        print("Progress: [4/4] Encoding sparse features with pd.factorize (Memory Optimized)...")
+        sparse_vocab_size = {}
+        for feat in tqdm(sparse_features, desc="Encoding Sparse Features"):
+            # 核心优化 3: 弃用极其耗费空间储存的 sklearn.LabelEncoder
+            # 采用 Pandas 底层的 factorize 算法不仅速度快 3~5 倍，而且内存占用极低
+            data[feat], uniques = pd.factorize(data[feat])
+            data[feat] = data[feat].astype(np.int32)
+            sparse_vocab_size[feat] = len(uniques)
 
-
-    # --- Step 6: Build vocabulary size dict for each sparse feature ---
-    # Computed after encoding; the value equals the number of rows needed in
-    # the corresponding embedding table
-    sparse_vocab_size = {feat: data[feat].nunique() for feat in sparse_features}
+        # 存为 npz 压缩文件
+        print(f"Saving the processed DataFrame to {npz_path} for faster future loading...")
+        # 将每一列单独存入，外加 vocab 的 dict
+        npz_dict = {col: data[col].values for col in col_names}
+        npz_dict['vocab'] = np.array(sparse_vocab_size)
+        np.savez_compressed(npz_path, **npz_dict)
 
     return data, sparse_vocab_size, dense_features, sparse_features
 
