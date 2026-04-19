@@ -16,7 +16,7 @@ def get_auto_embedding_dim(num_classes):
     int
         Recommended embedding dimension.
     """
-    return int(np.floor(6 * np.pow(num_classes, 0.25)))
+    return int(np.floor(6 * np.power(num_classes, 0.25)))
 
 
 class RandomNormal(object):

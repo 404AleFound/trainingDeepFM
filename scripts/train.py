@@ -180,21 +180,29 @@ def evaluate(
 # ------------------------------------------------------------------ #
 
 def main() -> None:
-    # ---- Hyperparameters ------------------------------------------ #
-    train_path    = './data/Criteo_sample/train_sample.txt'  # 请确保这个路径指向正确的训练数据文件
-    ckpt_dir      = './checkpoints'
-    batch_size    = 1024 * 1       # 8GB VRAM 比较充裕，可以提升到 2048 或 4096 提高 GPU 吞吐
-    num_epochs    = 50          # 轮数稍增加
-    learning_rate = 1e-3
-    warmup_epochs = 2           # linear warmup steps (in epochs)
-    weight_decay  = 1e-5        # [新增] 防止过拟合的权重衰减
-    embed_dim     = 32          # 典型的 CTR Embedding 维度推荐用 16-64 之间
-    mlp_dims      = [256, 128, 64] # 加深了网络
-    dropout       = 0.3         # 根据刚才的严重过拟合，提高到 0.3
-    val_ratio     = 0.1         # fraction of training data held out for validation
-    early_stop_patience = 5     # stop if no AUC improvement for N epochs
-    early_stop_min_delta = 1e-4 # minimum AUC gain to reset patience
-    device        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 超参数
+    train_path = './data/Criteo_sample/train_1m_time.txt'
+    val_path = './data/Criteo_sample/val_100k_time.txt'
+    ckpt_dir = './checkpoints'
+    batch_size = 1024 * 50
+    num_workers = 16
+    num_epochs = 25
+    learning_rate = 5e-4
+    min_lr = 1e-6
+    warmup_epochs = 5
+    scheduler_type = 'cosine'   # 'cosine' 或 'none'
+    dense_mode = 'bucketize_as_sparse'  # 将所有稠密特征分桶并当作类别特征
+    sparse_mode = 'hash'        # 'hash' 或 'lookup'
+    fill_dense = 0.0
+    fill_sparse = 'unknown'
+    weight_decay = 1e-3
+    embed_dim = 32
+    mlp_dims = [256, 128]
+    dropout = 0.5
+    early_stop_patience = num_epochs
+    early_stop_min_delta = 1e-4
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    seeds = 6666
 
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -220,6 +228,13 @@ def main() -> None:
     train_set = data_utils.Subset(dataset, range(train_size))
     val_set   = data_utils.Subset(dataset, range(train_size, len(dataset)))
 
+    train_size = len(train_set)
+    val_size = len(val_set)
+    dense_feas = train_set.dense_features
+    print(f"Dense features: {dense_feas[0:5]} ... {dense_feas[-5:]} (total {len(dense_feas)})")
+    sparse_feas = train_set.sparse_features
+    print(f"Sparse features: {sparse_feas[0:5]} ... {sparse_feas[-5:]} (total {len(sparse_feas)})")
+    vocab = {name: CATEGORY_FEATURE_STATS[name] for name in sparse_feas}
     collate_fn = build_collate_fn(dense_feas, sparse_feas)
 
     # num_workers=0: avoids multiprocess pickling issues on Windows;
@@ -241,26 +256,37 @@ def main() -> None:
         collate_fn=collate_fn,
     )
 
-    # ---- Feature definitions -------------------------------------- #
-    # DenseFeature  : passes the scalar value directly into the MLP
-    # SparseFeature : looks up a learned embed_dim-D embedding vector
-    dense_feature_objs  = [DenseFeature(name) for name in dense_feas]
+    # 特征定义
+    use_bucketized_dense = (dense_mode == 'bucketize_as_sparse')
+
+    if use_bucketized_dense:
+        dense_feature_objs = [
+            SparseFeature(
+                name,
+                vocab_size=processor.dense_processors[name].vocab_size,
+                embed_dim=embed_dim,
+            )
+            for name in dense_feas
+        ]
+    else:
+        dense_feature_objs = [DenseFeature(name) for name in dense_feas]
+
     sparse_feature_objs = [
         SparseFeature(name, vocab_size=vocab[name], embed_dim=embed_dim)
         for name in sparse_feas
     ]
 
-    # ---- Model ---------------------------------------------------- #
-    # FM   part : sparse features only — captures 2nd-order pairwise interactions
-    # Deep part : dense + sparse — captures higher-order non-linear interactions
+    deep_feature_objs = dense_feature_objs + sparse_feature_objs
+    print(f"Deep features: {[fea.name for fea in deep_feature_objs]} (total {len(deep_feature_objs)})")
+    # 分桶后的 dense 会作为 sparse 参与 FM；否则 FM 仅使用原始 sparse。
+    fm_feature_objs = deep_feature_objs if use_bucketized_dense else sparse_feature_objs
+    print(f"FM features: {[fea.name for fea in fm_feature_objs]} (total {len(fm_feature_objs)})")
+
+    # 模型
     model = DeepFM(
-        deep_features=dense_feature_objs + sparse_feature_objs,
-        fm_features=sparse_feature_objs,
-        mlp_params={
-            'dims':       mlp_dims,
-            'dropout':    dropout,
-            'activation': 'relu',
-        },
+        deep_features=deep_feature_objs,
+        fm_features=fm_feature_objs,
+        mlp_params={'dims':mlp_dims, 'dropout':dropout, 'activation': 'relu',}
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
