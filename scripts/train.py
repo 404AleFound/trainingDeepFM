@@ -3,41 +3,39 @@ file: train.py
 author: Ale
 date: 2026/04/17
 description:
-    - Full training pipeline for DeepFM on the Criteo CTR dataset.
-    - Uses torch_rechub's DeepFM with DenseFeature / SparseFeature abstractions.
-    - Evaluates with AUC (the standard offline metric for CTR prediction).
-    - Saves the best checkpoint and applies warmup + cosine annealing scheduling.
+    - DeepFM 训练主流程（Criteo CTR 数据集）
+    - 评估指标：AUC / LogLoss / ACC / Precision / Recall / F1
+    - 训练策略：Linear Warmup + CosineAnnealing + Early Stopping
 '''
 
 import logging
 import os
 import datetime
+import json
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data_utils
 from sklearn.metrics import (
-    roc_auc_score, accuracy_score, log_loss, 
+    roc_auc_score, accuracy_score, log_loss,
     precision_score, recall_score, f1_score
 )
 from tqdm import tqdm
-from typing import Tuple, List
-from torch_rechub.models.ranking import DeepFM
-from torch_rechub.basic.features import DenseFeature, SparseFeature
+from model import DeepFM
+from basic.features import DenseFeature, SparseFeature
 from utils import seed_everything
 from dataset import CriteoDataset
+from processor import CATEGORY_FEATURE_STATS, CriteoDataProcessor
 
-seed_everything(42)  # 确保全局随机种子固定，结果可复现
+seed_everything(42)
 
 # 创建 logger 文件夹并生成带时间戳的日志文件名
 os.makedirs('./logger', exist_ok=True)
 timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 log_file = os.path.join('./logger', f'{timestamp}.log')
 
-# Configure a module-level logger with timestamp + level + message layout.
-# basicConfig is called once here so any handler added by the caller is not
-# overridden; if the root logger already has handlers this call is a no-op.
+# 日志同时输出到控制台和文件
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-8s | %(message)s',
@@ -57,85 +55,65 @@ file_only_logger.addHandler(file_only_handler)
 file_only_logger.propagate = False
 
 
-# ------------------------------------------------------------------ #
-#  Collate function                                                    #
-# ------------------------------------------------------------------ #
+# ------------------------------
+# DataLoader 组装函数
+# ------------------------------
 
 def build_collate_fn(dense_features: list, sparse_features: list):
     """
-    Build a collate function for DataLoader.
+    将 Dataset 返回的 (label, dense_x, sparse_x) 组装为模型输入字典。
 
-    CriteoDataset.__getitem__ returns (label, dense_x, sparse_x) where
-    dense_x/sparse_x are flat tensors indexed by position.  torch_rechub's
-    EmbeddingLayer expects a dict keyed by feature name.  This function
-    converts between the two formats at batch-collation time.
-
-    Args:
-        dense_features  (list[str]): ordered dense column names, e.g. ['I1',...,'I13']
-        sparse_features (list[str]): ordered sparse column names, e.g. ['C1',...,'C26']
-
-    Returns:
-        callable: collate_fn suitable for torch.utils.data.DataLoader
+    返回:
+        可传入 DataLoader 的 collate_fn。
     """
     def _collate(batch):
-        labels   = torch.stack([item[0] for item in batch])   # [B]
-        dense_x  = torch.stack([item[1] for item in batch])   # [B, 13]
-        sparse_x = torch.stack([item[2] for item in batch])   # [B, 26]
+        labels = torch.stack([item[0] for item in batch])
+        dense_x = torch.stack([item[1] for item in batch])
+        sparse_x = torch.stack([item[2] for item in batch])
 
-        # Unpack each column into a named entry; the model indexes by name
         x: dict[str, torch.Tensor] = {}
         for i, name in enumerate(dense_features):
-            x[name] = dense_x[:, i]    # [B], float32
+            x[name] = dense_x[:, i]
         for i, name in enumerate(sparse_features):
-            x[name] = sparse_x[:, i]   # [B], long
+            x[name] = sparse_x[:, i]
 
         return x, labels
 
     return _collate
 
 
-# ------------------------------------------------------------------ #
-#  Train / evaluate helpers                                            #
-# ------------------------------------------------------------------ #
+# ------------------------------
+# 训练 / 评估函数
+# ------------------------------
 
 def train_one_epoch(
-model: nn.Module,
+    model: nn.Module,
     loader: data_utils.DataLoader,
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
     epoch: int,
 ) -> float:
-    """
-    Run one full pass over the training set.
-
-    Returns:
-        float: mean BCE loss across all mini-batches.
-    """
+    """执行一个 epoch 的训练，并返回平均 BCE loss。"""
     model.train()
     total_loss = 0.0
 
-    # leave=False: bar disappears after the epoch finishes, keeping the log clean
     pbar = tqdm(loader, desc='  Train', leave=False, unit='batch')
     for step, (x, labels) in enumerate(pbar):
         x      = {k: v.to(device) for k, v in x.items()}
         labels = labels.to(device)
 
         optimizer.zero_grad()
-        preds = model(x)                   # [B], already sigmoid-activated
-        loss  = criterion(preds, labels)
+        preds = model(x)
+        loss = criterion(preds, labels)
         loss.backward()
-        # Clip gradients to prevent large updates that destabilise training
-        # after the first epoch. max_norm=1.0 is a standard safe default.
+        # 梯度裁剪，避免训练不稳定
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
         
-        # 记录当前 step 的 loss，仅输出到文件
         file_only_logger.info(f"Epoch [{epoch}] Step [{step}/{len(loader)}] Train Loss: {loss.item():.4f}")
-        
-        # Update the postfix so the current batch loss is visible in real time
         pbar.set_postfix(loss=f'{loss.item():.4f}')
 
     return total_loss / len(loader)
@@ -147,18 +125,13 @@ def evaluate(
     loader: data_utils.DataLoader,
     device: torch.device,
 ) -> tuple[float, float, float, float, float, float]:
-    """
-    Compute AUC, LogLoss, Accuracy, Precision, Recall, and F1-Score.
-
-    Returns:
-        tuple: (AUC, LogLoss, Accuracy, Precision, Recall, F1-Score).
-    """
+    """在评估集上计算 AUC/LogLoss/ACC/Precision/Recall/F1。"""
     model.eval()
-    all_preds:  list[float] = []
+    all_preds: list[float] = []
     all_labels: list[float] = []
 
     for x, labels in tqdm(loader, desc='  Eval ', leave=False, unit='batch'):
-        x     = {k: v.to(device) for k, v in x.items()}
+        x = {k: v.to(device) for k, v in x.items()}
         preds = model(x).cpu()
         all_preds.extend(preds.tolist())
         all_labels.extend(labels.tolist())
@@ -170,63 +143,83 @@ def evaluate(
     acc = accuracy_score(all_labels, bin_preds)
     pre = precision_score(all_labels, bin_preds, zero_division=0)
     rec = recall_score(all_labels, bin_preds, zero_division=0)
-    f1  = f1_score(all_labels, bin_preds, zero_division=0)
+    f1 = f1_score(all_labels, bin_preds, zero_division=0)
     
-    return auc, logloss, acc, pre, rec, f1
+    return float(auc), float(logloss), float(acc), float(pre), float(rec), float(f1)
 
 
-# ------------------------------------------------------------------ #
-#  Main                                                                #
-# ------------------------------------------------------------------ #
+# ------------------------------
+# 主流程
+# ------------------------------
 
 def main() -> None:
     # 超参数
     train_path = './data/Criteo_sample/train_1m_time.txt'
     val_path = './data/Criteo_sample/val_100k_time.txt'
     ckpt_dir = './checkpoints'
-    batch_size = 1024 * 50
+    batch_size = 1024 * 4
     num_workers = 16
-    num_epochs = 25
-    learning_rate = 5e-4
+    num_epochs = 100
+    learning_rate = 5e-3
     min_lr = 1e-6
     warmup_epochs = 5
     scheduler_type = 'cosine'   # 'cosine' 或 'none'
-    dense_mode = 'bucketize_as_sparse'  # 将所有稠密特征分桶并当作类别特征
+    dense_mode = 'bucketize_as_sparse'  # 将所有稠密特征分桶并当作类别特征 bucketize_as_sparse
     sparse_mode = 'hash'        # 'hash' 或 'lookup'
     fill_dense = 0.0
     fill_sparse = 'unknown'
     weight_decay = 1e-3
     embed_dim = 32
-    mlp_dims = [256, 128]
+    mlp_dims = [256, 128, 64]
     dropout = 0.5
-    early_stop_patience = num_epochs
+    early_stop_patience = 15
     early_stop_min_delta = 1e-4
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seeds = 6666
 
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # ---- Dataset -------------------------------------------------- #
-    # IMPORTANT: load the full file once and split afterwards.
-    # Loading train/val from separate files would run LabelEncoder
-    # independently on each file, so the same hash string could receive
-    # a different integer index in val — corrupting the embedding lookup.
-    # Splitting a single dataset guarantees both subsets share the same
-    # encoder mapping fitted in Process_Data.
+    # 记录超参数，便于复现与对比
+    hyperparams = {
+        'train_path': train_path,
+        'val_path': val_path,
+        'ckpt_dir': ckpt_dir,
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'num_epochs': num_epochs,
+        'learning_rate': learning_rate,
+        'min_lr': min_lr,
+        'warmup_epochs': warmup_epochs,
+        'scheduler_type': scheduler_type,
+        'weight_decay': weight_decay,
+        'embed_dim': embed_dim,
+        'mlp_dims': mlp_dims,
+        'dropout': dropout,
+        'early_stop_patience': early_stop_patience,
+        'early_stop_min_delta': early_stop_min_delta,
+        'dense_mode': dense_mode,
+        'sparse_mode': sparse_mode,
+        'fill_dense': fill_dense,
+        'fill_sparse': fill_sparse,
+    }
+    pretty_hparams = json.dumps(
+        hyperparams,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    logger.info('Hyperparameters:\n%s', pretty_hparams)
+
+    # 数据集
     logger.info('Loading and processing dataset...')
-    dataset = CriteoDataset(train_path)
-
-    dense_feas  = dataset.dense_features     # ['I1', ..., 'I13']
-    sparse_feas = dataset.sparse_features    # ['C1', ..., 'C26']
-    vocab       = dataset.parse_vocab_size  # {name: num_unique_values}
-
-    val_size   = int(len(dataset) * val_ratio)
-    train_size = len(dataset) - val_size
-    # Temporal split: last val_ratio% of rows become validation.
-    # Criteo rows are chronologically ordered; random split leaks future
-    # data into training and inflates epoch-1 validation AUC artificially.
-    train_set = data_utils.Subset(dataset, range(train_size))
-    val_set   = data_utils.Subset(dataset, range(train_size, len(dataset)))
+    processor = CriteoDataProcessor(
+        dense_mode=dense_mode,
+        sparse_mode=sparse_mode,
+        fill_dense=fill_dense,
+        fill_sparse=fill_sparse,
+    )
+    train_set = CriteoDataset(train_path, processor)
+    val_set = CriteoDataset(val_path, processor)
 
     train_size = len(train_set)
     val_size = len(val_set)
@@ -236,14 +229,13 @@ def main() -> None:
     print(f"Sparse features: {sparse_feas[0:5]} ... {sparse_feas[-5:]} (total {len(sparse_feas)})")
     vocab = {name: CATEGORY_FEATURE_STATS[name] for name in sparse_feas}
     collate_fn = build_collate_fn(dense_feas, sparse_feas)
-
-    # num_workers=0: avoids multiprocess pickling issues on Windows;
-    # pin_memory speeds up host→GPU transfers when CUDA is available
+    
+    # DataLoader
     train_loader = data_utils.DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=(device.type == 'cuda'),
         collate_fn=collate_fn,
     )
@@ -251,7 +243,7 @@ def main() -> None:
         val_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=(device.type == 'cuda'),
         collate_fn=collate_fn,
     )
@@ -295,21 +287,14 @@ def main() -> None:
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    # Cosine annealing over the post-warmup epochs.
-    # Paired with the linear warmup above, this forms the standard
-    # "warmup + cosine decay" schedule used in modern deep learning.
-    # Advantages over ReduceLROnPlateau:
-    #   - Deterministic: LR follows a fixed curve regardless of val metric.
-    #   - Avoids the negative interaction where plateau detection fires at
-    #     epoch 3 (because epoch-1 AUC was best), halving LR before the
-    #     model has had a fair chance to learn at full LR.
-    # T_max = remaining epochs after warmup so the cosine reaches eta_min
-    # exactly at the last epoch.
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_epochs - warmup_epochs,
-        eta_min=1e-6,
-    )
+    scheduler = None
+    # 余弦衰减策略：warmup 后平滑衰减到 min_lr
+    if scheduler_type == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, num_epochs - warmup_epochs),
+            eta_min=min_lr,
+        )
 
     def set_lr(new_lr: float) -> None:
         for group in optimizer.param_groups:
@@ -321,19 +306,22 @@ def main() -> None:
     logger.info(
         f'Device : {device} Train  : {train_size:,} samples Val    : {val_size:,} samples'
     )
+    logger.info(
+        f'LR Strategy: {scheduler_type} | Base LR: {learning_rate:.2e} | Min LR: {min_lr:.2e} | Warmup: {warmup_epochs}'
+    )
 
-    # ---- Training loop -------------------------------------------- #
+    # 训练循环
     best_auc = float('-inf')
     no_improve_epochs = 0
     for epoch in range(1, num_epochs + 1):
         if warmup_epochs > 0 and epoch <= warmup_epochs:
-            # Linear warmup from 0 to learning_rate
+            # 线性 warmup
             warmup_lr = learning_rate * (epoch / warmup_epochs)
             set_lr(warmup_lr)
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
         val_auc, val_logloss, val_acc, val_pre, val_rec, val_f1 = evaluate(model, val_loader, device)
-        if epoch > warmup_epochs:
-            scheduler.step()   # CosineAnnealingLR needs no metric argument
+        if scheduler is not None and epoch > warmup_epochs:
+            scheduler.step()
 
         lr_now = optimizer.param_groups[0]['lr']
         logger.info(
@@ -348,15 +336,14 @@ def main() -> None:
             f'LR: {lr_now:.2e}'
         )
 
-        # Persist checkpoint if this is the best AUC seen so far.
+        # 保存最优 checkpoint
         if val_auc > best_auc:
             best_auc = val_auc
             ckpt_path = os.path.join(ckpt_dir, 'deepfm_best.pth')
             torch.save(model.state_dict(), ckpt_path)
             logger.info(f'=> Best model saved  (AUC={best_auc:.4f}, LogLoss={val_logloss:.4f}, F1={val_f1:.4f})')
 
-        # Count patience only AFTER warmup -- during warmup the LR is still
-        # rising, so non-improving epochs are expected and must not burn patience.
+        # warmup 结束后再计早停耐心值
         if epoch > warmup_epochs:
             if val_auc >= best_auc - early_stop_min_delta:
                 no_improve_epochs = 0

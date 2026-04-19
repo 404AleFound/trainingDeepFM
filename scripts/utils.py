@@ -22,10 +22,6 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-seed_everything(42)
-print("set global seed: 42")
-
-
 def sample_text_file(input_path, output_path, num_samples, seed=42):
     """Randomly sample lines from a text file and write them out."""
     import random
