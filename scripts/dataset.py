@@ -83,7 +83,7 @@ def Process_Data(data_path):
         # pd.read_csv 的 chunksize 参数会返回一个按块读取的生成器，防止巨大的内存一次性分配
         df_iter = pd.read_csv(data_path, sep='\t', header=None, names=col_names, chunksize=chunk_size)
         
-        for chunk in tqdm(df_iter, desc="Reading & Processing Chunks"):
+        for chunk in tqdm.tqdm(df_iter, desc="Reading & Processing Chunks"):
             # 在每个 Chunk 内部进行填补，避免读取全部数据后产生巨型 boolean mask 造成极具毁灭性的内存溢出
             # Dense: 为了统一且高效地分配内存，使用 0 填充
             chunk[dense_features] = chunk[dense_features].fillna(0.0)
@@ -109,7 +109,7 @@ def Process_Data(data_path):
         # --- Step 5: Encode sparse features ---
         print("Progress: [4/4] Encoding sparse features with pd.factorize (Memory Optimized)...")
         sparse_vocab_size = {}
-        for feat in tqdm(sparse_features, desc="Encoding Sparse Features"):
+        for feat in tqdm.tqdm(sparse_features, desc="Encoding Sparse Features"):
             # 核心优化 3: 弃用极其耗费空间储存的 sklearn.LabelEncoder
             # 采用 Pandas 底层的 factorize 算法不仅速度快 3~5 倍，而且内存占用极低
             data[feat], uniques = pd.factorize(data[feat])

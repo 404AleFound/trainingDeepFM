@@ -9,6 +9,30 @@
 ## 问题2
 数据处理
 
+### `Process_Data` 实现说明
+
+`Process_Data(data_path)` 负责将原始 TSV 文件转换为模型可直接消费的 DataFrame，返回值为：
+
+```
+data, sparse_vocab_size, dense_features, sparse_features
+```
+
+#### 处理流程
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 定义列名 | `label` + `I1`–`I13`（稠密）+ `C1`–`C26`（稀疏） |
+| 2 | 读取 TSV | `pd.read_csv(sep='\t', header=None)` |
+| 3 | 填充缺失值 | 稠密特征填中位数（对长尾分布鲁棒）；稀疏特征填 `"unknown"`（作为独立可编码类别） |
+| 4 | 归一化稠密特征 | `MinMaxScaler` → `[0, 1]`，适配 MLP 输入 |
+| 5 | 编码稀疏特征 | `LabelEncoder` 逐列编码，将哈希字符串映射为从 0 开始的整数索引，供 `nn.Embedding` 使用 |
+| 6 | 统计词表大小 | `sparse_vocab_size = {col: nunique()}` 用于确定每个 Embedding 表的行数 |
+
+#### 关键设计选择
+
+- **中位数填充（稠密）**：点击计数类特征分布极度右偏，中位数比均值更能代表典型值，避免极端值干扰归一化结果。
+- **`"unknown"` 填充（稀疏）**：保留缺失样本，不丢弃数据行；缺失值被视为一个独立类别参与训练。
+
 
 ## 问题1
 

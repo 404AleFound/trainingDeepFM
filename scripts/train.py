@@ -6,7 +6,7 @@ description:
     - Full training pipeline for DeepFM on the Criteo CTR dataset.
     - Uses torch_rechub's DeepFM with DenseFeature / SparseFeature abstractions.
     - Evaluates with AUC (the standard offline metric for CTR prediction).
-    - Saves the best checkpoint and applies ReduceLROnPlateau scheduling.
+    - Saves the best checkpoint and applies warmup + cosine annealing scheduling.
 '''
 
 import logging
@@ -125,6 +125,9 @@ model: nn.Module,
         preds = model(x)                   # [B], already sigmoid-activated
         loss  = criterion(preds, labels)
         loss.backward()
+        # Clip gradients to prevent large updates that destabilise training
+        # after the first epoch. max_norm=1.0 is a standard safe default.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
@@ -180,7 +183,7 @@ def main() -> None:
     # ---- Hyperparameters ------------------------------------------ #
     train_path    = './data/Criteo_sample/train_sample.txt'  # 请确保这个路径指向正确的训练数据文件
     ckpt_dir      = './checkpoints'
-    batch_size    = 1024 * 8       # 8GB VRAM 比较充裕，可以提升到 2048 或 4096 提高 GPU 吞吐
+    batch_size    = 1024 * 1       # 8GB VRAM 比较充裕，可以提升到 2048 或 4096 提高 GPU 吞吐
     num_epochs    = 50          # 轮数稍增加
     learning_rate = 1e-3
     warmup_epochs = 2           # linear warmup steps (in epochs)
@@ -211,10 +214,11 @@ def main() -> None:
 
     val_size   = int(len(dataset) * val_ratio)
     train_size = len(dataset) - val_size
-    train_set, val_set = data_utils.random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)   # reproducible split
-    )
+    # Temporal split: last val_ratio% of rows become validation.
+    # Criteo rows are chronologically ordered; random split leaks future
+    # data into training and inflates epoch-1 validation AUC artificially.
+    train_set = data_utils.Subset(dataset, range(train_size))
+    val_set   = data_utils.Subset(dataset, range(train_size, len(dataset)))
 
     collate_fn = build_collate_fn(dense_feas, sparse_feas)
 
@@ -259,12 +263,26 @@ def main() -> None:
         },
     ).to(device)
 
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f'Model trainable parameters: {num_params:,}')
+
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    # Halve LR after 2 epochs without AUC improvement; avoids manual decay tuning
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=2, factor=0.5
+    # Cosine annealing over the post-warmup epochs.
+    # Paired with the linear warmup above, this forms the standard
+    # "warmup + cosine decay" schedule used in modern deep learning.
+    # Advantages over ReduceLROnPlateau:
+    #   - Deterministic: LR follows a fixed curve regardless of val metric.
+    #   - Avoids the negative interaction where plateau detection fires at
+    #     epoch 3 (because epoch-1 AUC was best), halving LR before the
+    #     model has had a fair chance to learn at full LR.
+    # T_max = remaining epochs after warmup so the cosine reaches eta_min
+    # exactly at the last epoch.
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs - warmup_epochs,
+        eta_min=1e-6,
     )
 
     def set_lr(new_lr: float) -> None:
@@ -289,7 +307,7 @@ def main() -> None:
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
         val_auc, val_logloss, val_acc, val_pre, val_rec, val_f1 = evaluate(model, val_loader, device)
         if epoch > warmup_epochs:
-            scheduler.step(val_auc)
+            scheduler.step()   # CosineAnnealingLR needs no metric argument
 
         lr_now = optimizer.param_groups[0]['lr']
         logger.info(
@@ -304,19 +322,24 @@ def main() -> None:
             f'LR: {lr_now:.2e}'
         )
 
-        # Persist checkpoint whenever validation AUC improves
-        if val_auc > best_auc + early_stop_min_delta:
-            best_auc  = val_auc
-            no_improve_epochs = 0
+        # Persist checkpoint if this is the best AUC seen so far.
+        if val_auc > best_auc:
+            best_auc = val_auc
             ckpt_path = os.path.join(ckpt_dir, 'deepfm_best.pth')
             torch.save(model.state_dict(), ckpt_path)
             logger.info(f'=> Best model saved  (AUC={best_auc:.4f}, LogLoss={val_logloss:.4f}, F1={val_f1:.4f})')
-        else:
-            no_improve_epochs += 1
-            logger.info(f'=> No AUC improvement for {no_improve_epochs} epoch(s)')
-            if no_improve_epochs >= early_stop_patience:
-                logger.info(f'=> Early stopping triggered after {early_stop_patience} epochs without improvement')
-                break
+
+        # Count patience only AFTER warmup -- during warmup the LR is still
+        # rising, so non-improving epochs are expected and must not burn patience.
+        if epoch > warmup_epochs:
+            if val_auc >= best_auc - early_stop_min_delta:
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+                logger.info(f'=> No AUC improvement for {no_improve_epochs} epoch(s)')
+                if no_improve_epochs >= early_stop_patience:
+                    logger.info(f'=> Early stopping triggered after {early_stop_patience} epochs without improvement')
+                    break
 
     logger.info(f'\nTraining complete.  Best Val AUC: {best_auc:.4f}')
 
