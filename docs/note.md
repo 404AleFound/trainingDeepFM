@@ -280,9 +280,9 @@ if __name__ == '__main__':
 ### 训练结果
 
 最终训练在验证集上的指标为：**AUC=0.7835, LogLoss=0.4650**
-![](../logger/plots/20260419_053726_epoch_loss.png)
-![](../logger/plots/20260419_053726_epoch_train_loss_val_auc.png)
-![](../logger/plots/20260419_053726_step_loss.png)
+![](./assets/20260419_053726_epoch_loss.png)
+![](./assets/20260419_053726_epoch_train_loss_val_auc.png)
+![](./assets/20260419_053726_step_loss.png)
 
 | 参数 | 值 | 参数 | 值 |
 |---|---|---|---|
