@@ -251,3 +251,52 @@ if __name__ == "__main__":
     )
     print(split_stats)
     pass
+
+def deleteInvalidLogs(log_dir, required_tail_prefix="Training complete.  Best Val AUC:"):
+    """Delete .log files whose ending text is not the required training-complete marker.
+
+    Args:
+        log_dir: Directory containing log files.
+        required_tail_prefix: Required prefix in the last non-empty line of a valid log file.
+
+    Returns:
+        A list of deleted log file paths.
+    """
+    deleted_files = []
+
+    for filename in os.listdir(log_dir):
+        if not filename.lower().endswith(".log"):
+            continue
+
+        file_path = os.path.join(log_dir, filename)
+        if not os.path.isfile(file_path):
+            continue
+
+        # Read only the tail chunk for efficiency on large log files.
+        try:
+            with open(file_path, "rb") as f:
+                try:
+                    f.seek(-4096, os.SEEK_END)
+                except OSError:
+                    f.seek(0)
+                tail_text = f.read().decode("utf-8", errors="ignore")
+        except OSError:
+            tail_text = ""
+
+        lines = [line.strip() for line in tail_text.splitlines() if line.strip()]
+        last_line = lines[-1] if lines else ""
+
+        if not last_line.startswith(required_tail_prefix):
+            os.remove(file_path)
+            deleted_files.append(file_path)
+
+    return deleted_files
+
+if __name__ == "__main__":
+    # Example usage:
+    # deleted = deleteInvalidLogs("./logger")
+    # print(f"Deleted {len(deleted)} invalid log files:")
+    # for path in deleted:
+    #     print(f" - {path}")
+    
+    

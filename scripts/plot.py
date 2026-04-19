@@ -87,8 +87,45 @@ def plot_metrics(log_path, save_dir='./logger/plots'):
     # 2. 绘制 Epoch 级别的各种指标
     if epoch_metrics['epoch']:
         epochs = epoch_metrics['epoch']
+
+        # 绘图 A：Train Loss 与 Val AUC（双Y轴）
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+        line1 = ax1.plot(
+            epochs,
+            epoch_metrics['train_loss'],
+            marker='o',
+            color='tomato',
+            linewidth=2,
+            label='Train Loss'
+        )
+        ax1.set_xlabel('Epochs')
+        ax1.set_ylabel('Train Loss', color='tomato')
+        ax1.tick_params(axis='y', labelcolor='tomato')
+        ax1.set_xticks(epochs)
+        ax1.grid(True, linestyle='--', alpha=0.5)
+
+        ax2 = ax1.twinx()
+        line2 = ax2.plot(
+            epochs,
+            epoch_metrics['val_auc'],
+            marker='s',
+            color='royalblue',
+            linewidth=2,
+            label='Val AUC'
+        )
+        ax2.set_ylabel('Val AUC', color='royalblue')
+        ax2.tick_params(axis='y', labelcolor='royalblue')
+
+        lines = line1 + line2
+        ax1.legend(handles=lines, loc='best')
+        plt.title('Epoch-level: Train Loss and Val AUC')
+        plt.tight_layout()
+        epoch_auc_loss_file = os.path.join(save_dir, f'{log_name}_epoch_train_loss_val_auc.png')
+        plt.savefig(epoch_auc_loss_file, dpi=300)
+        plt.close(fig)
+        print(f"Saved: {epoch_auc_loss_file}")
         
-        # 绘图 A：训练 Loss 与 验证 LogLoss 对比
+        # 绘图 B：训练 Loss 与 验证 LogLoss 对比
         plt.figure(figsize=(10, 5))
         plt.plot(epochs, epoch_metrics['train_loss'], marker='o', label='Train Loss', color='tomato', linewidth=2)
         plt.plot(epochs, epoch_metrics['val_logloss'], marker='s', label='Val LogLoss', color='teal', linewidth=2)
@@ -104,7 +141,7 @@ def plot_metrics(log_path, save_dir='./logger/plots'):
         plt.close()
         print(f"Saved: {epoch_loss_file}")
 
-        # 绘图 B：综合评估指标评分 (AUC, ACC, F1, Pre, Rec)
+        # 绘图 C：综合评估指标评分 (AUC, ACC, F1, Pre, Rec)
         plt.figure(figsize=(10, 6))
         plt.plot(epochs, epoch_metrics['val_auc'], marker='o', label='Val AUC', color='purple', linewidth=2)
         plt.plot(epochs, epoch_metrics['val_acc'], marker='s', label='Val ACC', color='green', linewidth=2)
