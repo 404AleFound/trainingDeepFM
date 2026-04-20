@@ -11,6 +11,7 @@ def parse_log_file(log_path):
     epoch_metrics = {
         'epoch': [],
         'train_loss': [],
+        'lr': [],
         'val_auc': [],
         'val_logloss': [],
         'val_acc': [],
@@ -24,6 +25,7 @@ def parse_log_file(log_path):
     
     # 正则表达式匹配 epoch level metrics 
     # (例如: Epoch [ 1/ 5] | Train Loss: 0.5213 | Val AUC: 0.7321 | LogLoss: 0.4901 | ACC: 0.8123 | Pre: 0.0000 | Rec: 0.0000 | F1: 0.0000 | LR: 1.00e-03)
+    # 支持末尾包含学习率的行，例如: ... | F1: 0.0000 | LR: 1.00e-03
     epoch_pattern = re.compile(
         r'Epoch \[\s*(\d+)/\s*\d+\]\s*\|\s*'
         r'Train Loss:\s*([0-9.]+)\s*\|\s*'
@@ -33,6 +35,7 @@ def parse_log_file(log_path):
         r'Pre:\s*([0-9.]+)\s*\|\s*'
         r'Rec:\s*([0-9.]+)\s*\|\s*'
         r'F1:\s*([0-9.]+)'
+        r'(?:\s*\|\s*LR:\s*([0-9.eE+-]+))?'
     )
 
     with open(log_path, 'r', encoding='utf-8') as f:
@@ -54,6 +57,19 @@ def parse_log_file(log_path):
                 epoch_metrics['val_pre'].append(float(epoch_match.group(6)))
                 epoch_metrics['val_rec'].append(float(epoch_match.group(7)))
                 epoch_metrics['val_f1'].append(float(epoch_match.group(8)))
+                # 可选的第9组是学习率
+                lr_group = epoch_match.group(9) if epoch_match.groups() and len(epoch_match.groups()) >= 9 else None
+                if lr_group:
+                    try:
+                        epoch_metrics['lr'].append(float(lr_group))
+                    except ValueError:
+                        # 处理科学计数法或其它格式
+                        try:
+                            epoch_metrics['lr'].append(float(r'{:.6e}'.format(float(lr_group))))
+                        except Exception:
+                            epoch_metrics['lr'].append(None)
+                else:
+                    epoch_metrics['lr'].append(None)
     
     return step_losses, epoch_metrics
 
@@ -160,6 +176,34 @@ def plot_metrics(log_path, save_dir='./logger/plots'):
         plt.savefig(epoch_metrics_file, dpi=300)
         plt.close()
         print(f"Saved: {epoch_metrics_file}")
+        
+        # 绘图 D: 学习率和训练损失变化的曲线
+        if any(x is not None for x in epoch_metrics['lr']):
+            fig, ax1 = plt.subplots(figsize=(10, 5))
+            ax1.plot(epochs, epoch_metrics['train_loss'], marker='o', color='tomato', linewidth=2, label='Train Loss')
+            ax1.set_xlabel('Epochs')
+            ax1.set_ylabel('Train Loss', color='tomato')
+            ax1.tick_params(axis='y', labelcolor='tomato')
+            ax1.set_xticks(epochs)
+            ax1.grid(True, linestyle='--', alpha=0.5)
+
+            ax2 = ax1.twinx()
+            # 将 None 值替换为 nan 以便绘图
+            import numpy as _np
+            lr_vals = [_np.nan if v is None else v for v in epoch_metrics['lr']]
+            ax2.plot(epochs, lr_vals, marker='s', color='royalblue', linewidth=2, label='LR')
+            ax2.set_ylabel('Learning Rate', color='royalblue')
+            ax2.tick_params(axis='y', labelcolor='royalblue')
+
+            lines = ax1.get_lines() + ax2.get_lines()
+            ax1.legend(handles=lines, loc='best')
+            plt.title('Epoch-level: Train Loss and Learning Rate')
+            plt.tight_layout()
+            epoch_lr_file = os.path.join(save_dir, f'{log_name}_epoch_loss_lr.png')
+            plt.savefig(epoch_lr_file, dpi=300)
+            plt.close(fig)
+            print(f"Saved: {epoch_lr_file}")
+        
 
 def main():
     # 自动去找 logger 文件夹下面的最新 .log 文件

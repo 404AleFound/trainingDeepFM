@@ -6,6 +6,21 @@ Topic: CTR & DeepFM 学习笔记
 
 # DeepFM学习笔记
 
+**目录：**
+- [CTR任务简介](#ctr任务简介)
+- [DeepFM方案](#deepfm方案)
+    - [DeepFM架构](#deepfm-架构)
+    - [DeepFM](#deepfm-数据流)
+- [DeepFM实践](#deepfm实践)
+    - [数据处理](#数据处理)
+    - [网络框架](#网络框架)
+    - [训练框架](#训练框架)
+    - [训练结果](#训练结果)
+- [常见问题](#常见问题)
+    - [数据处理](#数据处理-1)
+    - [模型训练](#模型训练)
+    - [指标选择](#指标选择)
+
 ## CTR任务简介
 
 > [!NOTE]
@@ -39,7 +54,7 @@ Topic: CTR & DeepFM 学习笔记
 
 > [!NOTE]
 >
-> 这一部分主要介绍 DeepFM 的两个组件：FM 和 DNN。
+> 这一部分主要介绍 DeepFM 的构成，以及其的两个组件：FM 和 DNN。
 
 
 <img src="./assets/model.png" alt="model" style="zoom:50%;" />
@@ -57,6 +72,10 @@ Topic: CTR & DeepFM 学习笔记
   * 最终将 DNN 的输出与 FM 的输出结合起来，这样模型就可以通过端到端的方式，联合捕获低维和高维的模式特征。
 
 ### DeepFM 数据流
+
+> [!note]
+> 该部分对在Pytorch 中进行针对 DeepFM 的搭建和训练进行汇总和总结
+>
 **数据流与张量形状（前向传播） (Data Flow & Tensor Shapes):**
 
 * 输入层 (Input layer): `[batch_size, num_fields]`
@@ -203,7 +222,7 @@ B. squeeze_dim=True
 - 适合 MLP（每个样本一行向量）
 ```
 
-其中，对于 FM 部分的一阶输出和二阶输出都使用了 Embedding 后的特征，而没有直接使用稀疏的类别特征。同时，为了尽可能贴合原始论文的设计，将类别设计为
+其中，对于 FM 部分的一阶输出和二阶输出都使用了 Embedding 后的特征，而没有直接使用稀疏的类别特征。同时，原始论文中并没有提及针对数值这种稠密特征如何处理，这里可以利用分桶离散的方法，将其离散为稀疏的类别特征，和其他类别特征拼接后一起输入。
 
 ```python
 # 特征定义
@@ -283,7 +302,9 @@ if __name__ == '__main__':
 ![](./assets/20260419_053726_epoch_loss.png)
 ![](./assets/20260419_053726_epoch_train_loss_val_auc.png)
 ![](./assets/20260419_053726_step_loss.png)
-
+![](./assets/20260419_053726_epoch_loss_lr.png)
+可以看到模型在第 23 个 Epoch，在测试集上的性能最后，之后其开始发生过拟合现象。
+训练使用的超参数如下：
 | 参数 | 值 | 参数 | 值 |
 |---|---|---|---|
 | **batch_size** | 4096 | **dense_mode** | bucketize_as_sparse |

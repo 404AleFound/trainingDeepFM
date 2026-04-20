@@ -292,11 +292,3 @@ def deleteInvalidLogs(log_dir, required_tail_prefix="Training complete.  Best Va
 
     return deleted_files
 
-if __name__ == "__main__":
-    # Example usage:
-    # deleted = deleteInvalidLogs("./logger")
-    # print(f"Deleted {len(deleted)} invalid log files:")
-    # for path in deleted:
-    #     print(f" - {path}")
-    
-    

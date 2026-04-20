@@ -9,6 +9,8 @@
 - 训练过程输出完整日志，支持自动解析并绘图。
 - 保存最优 AUC 的模型权重到 checkpoints。
 
+建议阅读学习笔记：[node.md](./docs/note.md)
+
 ## 1. 目录说明
 
 ```text
