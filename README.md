@@ -36,9 +36,29 @@ trainingDeepFM/
 │   ├── processor.py
 │   ├── train.py
 │   └── utils.py
-├── requrement.txt
+├── requirements.txt
+├── 20260419_162644_good.log
 └── README.md
 ```
+
+下面对上面目录中的主要文件和文件夹做简要说明：
+
+- `checkpoints/`：保存训练过程中生成的模型权重（例如 `deepfm_best.pth` 为在验证集上表现最好的权重）。
+- `data/`：原始与样例数据目录，包含完整的 Criteo 数据集、样例子集与小规模测试集（用于快速调试）。
+- `docs/`：项目文档与学习笔记，`note.md` 为作者笔记，`assets/` 存放说明图像与结果可视化截图。
+- `logger/`：训练过程产生的日志文件与可视化输出（如 `logger/plots/` 存放绘图结果）。
+- `scripts/`：主要可执行脚本与模型代码：
+  - `scripts/basic/`：基础模块（激活函数、特征处理、基础层实现等）。
+  - `scripts/dataset.py`：数据集封装与 DataLoader 相关实现。
+  - `scripts/processor.py`：数据预处理、缺失值填充与特征编码策略实现。
+  - `scripts/model.py`：DeepFM 模型定义（FM + DNN 结构）。
+  - `scripts/train.py`：训练、验证主流程、日志记录、checkpoint 保存与早停逻辑。
+  - `scripts/test.py`：测试/推理脚本（示例），用于评估已保存模型。
+  - `scripts/plot.py`：训练日志解析与绘图工具。
+  - `scripts/utils.py`：通用工具函数（配置解析、指标计算等）。
+- `requirements.txt`：Python 依赖清单，用于通过 `pip install -r requirements.txt` 安装环境。
+- `20260419_162644_good.log`：示例训练日志文件（用于演示与调试）。
+- `README.md`：项目说明文档（当前文件）。
 
 ## 2. 环境安装
 
